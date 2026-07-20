@@ -10,7 +10,7 @@
 //! [`DpiCycleState::capabilities`] stays `None` and presets cycle at their raw
 //! (still valid) values — exactly the GUI's "window never opened" behaviour.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use openlogi_core::config::{Config, ScrollResolution};
@@ -18,13 +18,12 @@ use openlogi_core::device::{Capabilities, DeviceInventory};
 use openlogi_hid::{CaptureChannel, DeviceRoute};
 use tracing::warn;
 
-use crate::bindings::{bindings_for, gesture_bindings_for, oshook_gestures_for};
+use crate::bindings::{bindings_for, oshook_gestures_for};
 use crate::capture_plan::{DeviceCapturePlan, SharedCapturePlans, plan_for_device};
 use crate::device_order::DeviceStableId;
 use crate::hook_runtime::{HookMaps, SharedHookMaps};
 use crate::ipc::InventoryHealth;
 use crate::receiver_access::ReceiverAccess;
-use crate::watchers::gesture::GestureBindings;
 use crate::{DpiCycleState, DpiCycles};
 
 /// The minimal per-device facts the agent needs: the config key (binding /
@@ -54,7 +53,6 @@ pub struct SharedRuntime {
     /// rebuild publishes both atomically (see [`HookMaps`]). Also read by the
     /// gesture watcher for the thumb-wheel/DPI-button single actions.
     pub hook_maps: SharedHookMaps,
-    pub gesture_bindings: GestureBindings,
     pub dpi_cycle: Arc<RwLock<DpiCycles>>,
     /// One capture plan per online device — what to divert and how to
     /// dispatch, keyed by the device the events arrive on. Carries each
@@ -108,7 +106,6 @@ impl Orchestrator {
     pub fn new(config: Config) -> Self {
         let shared = SharedRuntime {
             hook_maps: Arc::new(RwLock::new(HookMaps::default())),
-            gesture_bindings: Arc::new(RwLock::new(BTreeMap::new())),
             dpi_cycle: Arc::new(RwLock::new(DpiCycles::default())),
             capture_plans: Arc::new(RwLock::new(Vec::new())),
             capture_channel: Arc::new(RwLock::new(None)),
@@ -166,11 +163,6 @@ impl Orchestrator {
             &self.shared.hook_maps,
             self.hook_maps_for(key, self.current_app.as_deref()),
             "hook_maps",
-        );
-        write_value(
-            &self.shared.gesture_bindings,
-            gesture_bindings_for(&self.config, key),
-            "gesture_bindings",
         );
         self.publish_device_runtime();
     }
