@@ -37,11 +37,20 @@ pub const FEATURE_ID: u16 = 0x1b04;
 /// Control ID of the MX-line dedicated gesture button (`Mouse_Gesture_Button`,
 /// Logitech "App_Switch_Gesture").
 ///
-/// MX Master 4 also has a separate Haptic Sense Panel in the thumb area. That
-/// panel is not this CID; it must be discovered from the device's `0x1b04`
-/// control table and supported explicitly before OpenLogi treats it as a
-/// bindable/capturable input.
+/// MX Master 4 also has a separate Haptic Sense Panel in the thumb area; that
+/// panel is [`HAPTIC_PANEL_CID`], not this CID.
 pub const GESTURE_BUTTON_CID: u16 = 0x00c3;
+
+/// Control ID of the MX Master 4 Haptic Sense Panel — the touch-sensitive
+/// thumb rest that replaces the dedicated gesture button on that model.
+///
+/// Reverse-engineered on real hardware (MX Master 4, Bolt receiver); not in
+/// the published `0x1b04` control-ID lists. Press/release arrive as
+/// `divertedButtonsEvent` with this CID, and while touched the panel streams
+/// relative raw-XY at ~125 Hz exactly like the dedicated gesture button —
+/// except that the first raw-XY sample after contact is a large position jump
+/// that must be discarded before feeding a swipe accumulator.
+pub const HAPTIC_PANEL_CID: u16 = 0x01a0;
 
 /// Control IDs of the "DPI / ModeShift" button family. Whichever a device
 /// exposes (and can divert) is captured and mapped to
