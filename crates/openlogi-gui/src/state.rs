@@ -1181,6 +1181,21 @@ impl AppState {
         )
     }
 
+    /// Per-direction display maps for every gesture-mode button of the current
+    /// device, keyed by button — what each button's gesture menu edits and what
+    /// the runtime dispatches for it. HID++ sources come fully seeded (matching
+    /// the gesture watcher's projection); OS-hook buttons show their raw stored
+    /// map (matching the OS hook's dispatch). Empty when no device is selected.
+    #[must_use]
+    #[allow(
+        dead_code,
+        clippy::unused_self,
+        reason = "RED stub — wired into the views by the GREEN change"
+    )]
+    pub fn current_gesture_maps(&self) -> BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>> {
+        BTreeMap::new()
+    }
+
     fn gesture_bindings_for_current(&self) -> BTreeMap<GestureDirection, Action> {
         let Some(key) = self.current_record().map(|r| r.config_key.as_str()) else {
             return BTreeMap::new();
@@ -1331,6 +1346,7 @@ fn set_scroll_resolution_if_supported(
 impl Global for AppState {}
 
 #[cfg(test)]
+#[allow(clippy::expect_used, reason = "expect/unwrap are idiomatic in tests")]
 mod tests {
     use openlogi_core::config::{Config, DeviceIdentity, ScrollResolution};
     use openlogi_core::device::{Capabilities, DeviceKind, DeviceModelInfo, DeviceTransports};
@@ -1366,6 +1382,43 @@ mod tests {
         assert_eq!(
             state.asset_models(),
             vec![(model, Some("MX Anywhere 3S".to_string()))]
+        );
+    }
+
+    #[test]
+    #[ignore = "RED: per-button gesture maps not implemented yet"]
+    fn gesture_maps_cover_every_gesture_mode_button() {
+        // With per-button gesture mode, the GUI's display maps carry one entry
+        // per gesture-mode button: the dedicated button's seeded default map
+        // plus a promoted OS-hook button's stored map — simultaneously.
+        use openlogi_core::binding::{ButtonId, GestureDirection};
+
+        let mut config = Config::default();
+        config.set_device_identity(
+            "2b042",
+            DeviceIdentity {
+                display_name: "MX Master 4".to_string(),
+                kind: DeviceKind::Mouse,
+                capabilities: Capabilities::presumed_from_kind(DeviceKind::Mouse),
+                model_info: None,
+                codename: None,
+            },
+        );
+        config.set_gesture_mode("2b042", ButtonId::Back, true);
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::with_runtime(config, &[], &AssetResolver::new(), commands);
+
+        let maps = state.current_gesture_maps();
+        let dedicated = maps
+            .get(&ButtonId::GestureButton)
+            .expect("the dedicated button's default gesture mode must be shown");
+        assert!(
+            dedicated.contains_key(&GestureDirection::Up),
+            "HID++ maps are shown seeded, matching watcher dispatch"
+        );
+        assert!(
+            maps.contains_key(&ButtonId::Back),
+            "a promoted OS-hook button gets its own menu simultaneously"
         );
     }
 
