@@ -157,6 +157,8 @@ _version: 1
 "DPI Toggle": "DPI-Umschaltung"
 "Thumb Wheel": "Daumenrad"
 "Gesture Button": "Gestentaste"
+"Gestures": "Gesten"
+"Turn off gestures": "Gesten deaktivieren"
 "Haptic Panel": "Haptik-Panel"
 "Up": "Oben"
 "Down": "Unten"

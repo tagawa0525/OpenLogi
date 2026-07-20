@@ -157,6 +157,8 @@ _version: 1
 "DPI Toggle": "DPI-växling"
 "Thumb Wheel": "Tumhjul"
 "Gesture Button": "Gestknapp"
+"Gestures": "Gester"
+"Turn off gestures": "Stäng av gester"
 "Haptic Panel": "Haptisk panel"
 "Up": "Upp"
 "Down": "Ned"
