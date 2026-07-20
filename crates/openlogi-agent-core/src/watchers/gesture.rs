@@ -107,7 +107,7 @@ fn thumbwheel_armed(plan: &DeviceCapturePlan) -> bool {
 fn spec_for(plan: &DeviceCapturePlan) -> CaptureSpec {
     CaptureSpec {
         capture_thumbwheel: thumbwheel_armed(plan),
-        divert_gesture_source: plan.gesture_source_cid,
+        divert_gesture_sources: plan.gesture_source_cids.clone(),
         divert_buttons: plan.divert_buttons.clone(),
     }
 }
@@ -381,12 +381,16 @@ fn dispatch(
         return;
     };
     match input {
-        CapturedInput::Gesture(direction) => {
-            if let Some(action) = plan.gesture_bindings.get(&direction) {
-                debug!(key, ?direction, action = %action.label(), "gesture → action");
+        CapturedInput::Gesture(button, direction) => {
+            if let Some(action) = plan
+                .gesture_bindings
+                .get(&button)
+                .and_then(|map| map.get(&direction))
+            {
+                debug!(key, %button, ?direction, action = %action.label(), "gesture → action");
                 hook_runtime::dispatch_action(action, dpi_cycle, Some(key), capture);
             } else {
-                debug!(key, ?direction, "gesture with no binding — ignored");
+                debug!(key, %button, ?direction, "gesture with no binding — ignored");
             }
         }
         CapturedInput::ButtonPressed(button) => {
