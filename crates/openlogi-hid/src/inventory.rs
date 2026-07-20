@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -107,6 +108,12 @@ pub struct Enumerator {
     /// cached channel must be dropped and reopened (see [`crate::node_ledger`]).
     ledger: NodeLedger<async_hid::DeviceId>,
     tick: u64,
+    /// Where the immutable probe cache is persisted across restarts, `None`
+    /// for a memory-only enumerator (one-shot CLI calls, tests).
+    persist_path: Option<PathBuf>,
+    /// Whether the persistable cache content changed since the last save —
+    /// fresh full probes and evictions, not per-tick battery refreshes.
+    cache_dirty: bool,
 }
 
 /// An open channel to a receiver / direct-device HID node, held across
@@ -205,6 +212,49 @@ const ONESHOT_ATTEMPTS: u8 = 4;
 const ONESHOT_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 impl Enumerator {
+    /// An enumerator whose immutable probe cache is warm-started from (and
+    /// written back to) the on-disk cache under the app data dir, so a device
+    /// fully probed once keeps its identity across restarts. Falls back to
+    /// memory-only when no data dir is resolvable.
+    #[must_use]
+    pub fn with_persistence() -> Self {
+        let persist_path = match openlogi_core::paths::data_dir() {
+            Ok(dir) => Some(dir.join("probe-cache.json")),
+            Err(e) => {
+                warn!(error = %e, "no data dir — probe cache is memory-only");
+                None
+            }
+        };
+        let cache = persist_path
+            .as_deref()
+            .map(persist::load)
+            .unwrap_or_default();
+        if !cache.is_empty() {
+            debug!(entries = cache.len(), "probe cache warm-started from disk");
+        }
+        Self {
+            cache,
+            persist_path,
+            ..Self::default()
+        }
+    }
+
+    /// Write the cache through to disk when its persistable content changed
+    /// this tick. Best-effort: a failed write is logged and retried on the
+    /// next dirty tick.
+    fn flush_cache(&mut self) {
+        if !self.cache_dirty {
+            return;
+        }
+        let Some(path) = self.persist_path.as_deref() else {
+            return;
+        };
+        match persist::save(path, &self.cache) {
+            Ok(()) => self.cache_dirty = false,
+            Err(e) => warn!(error = %e, ?path, "failed to persist probe cache"),
+        }
+    }
+
     /// One enumeration pass, reusing the cache from prior passes. Probes every
     /// HID candidate concurrently (so one asleep node that burns the whole
     /// `PROBE_BUDGET` can't stall the others), reusing each device's cached
@@ -337,7 +387,15 @@ impl Enumerator {
         let mut seen_keys = HashSet::new();
         for outcome in outcomes {
             match outcome {
-                CacheOutcome::Fresh(key, cached) | CacheOutcome::Update(key, cached) => {
+                CacheOutcome::Fresh(key, cached) => {
+                    seen_keys.insert(key.clone());
+                    self.cache.insert(key, cached);
+                    // A completed full probe is worth writing through; battery
+                    // `Update`s are not (they would rewrite the file every
+                    // tick for a value that is re-read live anyway).
+                    self.cache_dirty = true;
+                }
+                CacheOutcome::Update(key, cached) => {
                     seen_keys.insert(key.clone());
                     self.cache.insert(key, cached);
                 }
@@ -348,6 +406,7 @@ impl Enumerator {
             }
         }
         self.evict_unseen(&seen_keys);
+        self.flush_cache();
         Ok((inventories, all_complete, all_healthy))
     }
 
@@ -369,6 +428,7 @@ impl Enumerator {
             if *misses > CACHE_MISS_GRACE {
                 self.cache.remove(&key);
                 self.misses.remove(&key);
+                self.cache_dirty = true;
             }
         }
     }

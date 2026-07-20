@@ -283,7 +283,6 @@ fn codename_rejects_short_response() {
 }
 
 #[test]
-#[ignore = "RED: probe-cache persistence not implemented yet"]
 fn probe_cache_roundtrips_through_disk() {
     // A device fully probed once must keep its identity across restarts: the
     // persisted cache is what spares a fresh process the expensive (and on
@@ -349,4 +348,21 @@ fn probe_cache_roundtrips_through_disk() {
         }),
         "unifying entries persist too"
     );
+}
+
+#[test]
+fn probe_cache_load_tolerates_missing_or_garbage_files() {
+    // The persisted cache is a warm-start optimization: a missing file, torn
+    // write, or foreign schema must yield an empty cache, never an error.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("nope.json");
+    assert!(persist::load(&missing).is_empty());
+
+    let garbage = dir.path().join("garbage.json");
+    std::fs::write(&garbage, b"not json at all").expect("write");
+    assert!(persist::load(&garbage).is_empty());
+
+    let wrong_version = dir.path().join("future.json");
+    std::fs::write(&wrong_version, br#"{"version":999,"entries":[]}"#).expect("write");
+    assert!(persist::load(&wrong_version).is_empty());
 }
