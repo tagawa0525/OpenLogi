@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, App, BorrowAppContext as _, Context, ElementId, Entity, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, RenderOnce,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, canvas, div, hsla, img,
-    prelude::FluentBuilder as _, px, rgb, svg,
+    Anchor, AnyElement, App, Context, ElementId, Entity, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, RenderOnce, StatefulInteractiveElement as _, Styled,
+    Subscription, Window, canvas, div, hsla, img, prelude::FluentBuilder as _, px, rgb, svg,
 };
 use gpui_component::{Icon, IconName, Selectable, h_flex, popover::Popover, v_flex};
 
@@ -25,7 +24,7 @@ use crate::mouse_model::picker::{
     GESTURE_BUTTON_ICON, action_icon_path, action_picker, gesture_overview,
 };
 use crate::state::AppState;
-use crate::theme::{self, ACCENT_BLUE, Palette, SelectableStyle, Typography as _};
+use crate::theme::{self, ACCENT_BLUE, Palette, Typography as _};
 
 const SIDE_W: f32 = 180.;
 const SIDE_GAP: f32 = 24.;
@@ -37,8 +36,8 @@ const CARD_EDGE_INSET: f32 = SIDE_GAP + (SIDE_W - LABEL_W);
 const HOTSPOT_DOT: f32 = 12.;
 
 /// Vertical space around the model that it can't draw into: the detail header
-/// and footer, the buttons-tab padding, and the gesture selector row above the
-/// canvas. The model scales to fit whatever viewport height remains.
+/// and footer, plus the buttons-tab padding. The model scales to fit whatever
+/// viewport height remains.
 const MODEL_VERTICAL_RESERVE: f32 = 224.;
 /// Floor for the scaled model height. Below this the evenly-slotted side labels
 /// (≈[`LABEL_H`] each) start to overlap; the window's minimum height is sized to
@@ -90,14 +89,14 @@ impl MouseModelView {
 
 impl Render for MouseModelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (asset, active, bindings, gesture_owner, glow) = cx
+        let (asset, active, bindings, gesture_buttons, glow) = cx
             .try_global::<AppState>()
             .map(|s| {
                 (
                     s.current_record().and_then(|r| r.asset.clone()),
                     s.active_button,
                     s.button_bindings.clone(),
-                    s.current_gesture_owner(),
+                    s.gesture_bindings.keys().copied().collect::<Vec<_>>(),
                     s.current_record().and_then(|r| keyboard_glow(s, r)),
                 )
             })
@@ -131,12 +130,6 @@ impl Render for MouseModelView {
 
         let hotspots_outer = hotspots.clone();
         let labels_outer = labels.clone();
-        // Resolve the gesture owner against the buttons this device actually has:
-        // a mouse with no HID++ gesture button must not surface that default owner
-        // (it has none) — the role then reads as "Off" until the user picks a
-        // present button. Display-only; the stored config still infers as usual.
-        let capable = gesture_capable_buttons(&labels_outer);
-        let gesture_owner = gesture_owner.filter(|id| capable.contains(id));
         let leader_canvas = leader_canvas(hotspots, labels, highlight, mouse_left, mouse_w);
         let breathing_art = breathing_art(asset.as_ref(), mouse_left, mouse_w, mouse_h, pal, glow);
         let hotspots_layer = hotspots_layer(
@@ -146,7 +139,7 @@ impl Render for MouseModelView {
             mouse_h,
             hovered,
             active,
-            gesture_owner,
+            &gesture_buttons,
             &view,
         );
         let canvas = div()
@@ -156,7 +149,7 @@ impl Render for MouseModelView {
             .child(breathing_art)
             .child(leader_canvas)
             .children(labels_outer.iter().enumerate().map(|(idx, label)| {
-                let binding = if Some(label.id) == gesture_owner {
+                let binding = if gesture_buttons.contains(&label.id) {
                     BindingLabel {
                         text: tr!("5 directions"),
                         is_default: false,
@@ -186,24 +179,15 @@ impl Render for MouseModelView {
                     mouse_w,
                     hovered,
                     active,
-                    gesture_owner,
+                    gesture_buttons.contains(&label.id),
                     &view,
                 )
             }))
             .child(hotspots_layer);
 
-        // The gesture-button selector sits above the mouse: a single-select of
-        // the device's gesture-capable buttons (the HID++ gesture button plus the
-        // OS-hook Middle/Back/Forward) makes the one-gesture-button-per-device
-        // lock visible and obvious — pick one and its card opens the gesture
-        // menu, the rest stay single-action.
-        v_flex()
-            .w(px(canvas_w))
-            .gap_4()
-            .when(!capable.is_empty(), |col| {
-                col.child(gesture_owner_selector(&capable, gesture_owner, &view, pal))
-            })
-            .child(canvas)
+        // Gesture mode is a per-button fact edited inside each button's own
+        // picker (the "Gestures" entry) — no device-level selector row.
+        v_flex().w(px(canvas_w)).gap_4().child(canvas)
     }
 }
 
@@ -247,99 +231,6 @@ fn scaled_model(
             labels,
         )
     }
-}
-
-/// The gesture-capable buttons present on this device, in a stable display
-/// order: the HID++ sources (gesture button, haptic panel) first, then the
-/// OS-hook Middle/Back/Forward.
-fn gesture_capable_buttons(labels: &[Label]) -> Vec<ButtonId> {
-    const ORDER: [ButtonId; 5] = [
-        ButtonId::GestureButton,
-        ButtonId::HapticPanel,
-        ButtonId::MiddleClick,
-        ButtonId::Back,
-        ButtonId::Forward,
-    ];
-    ORDER
-        .into_iter()
-        .filter(|id| labels.iter().any(|l| l.id == *id))
-        .collect()
-}
-
-/// Short, context-appropriate name for a gesture-button choice.
-fn gesture_owner_label(btn: ButtonId) -> &'static str {
-    match btn {
-        ButtonId::GestureButton => "Gesture Button",
-        ButtonId::MiddleClick => "Middle",
-        ButtonId::Back => "Back",
-        ButtonId::Forward => "Forward",
-        other => other.label(),
-    }
-}
-
-/// The "Gesture button: ( … )" single-select row above the mouse. The single
-/// select makes the one-gesture-button-per-device lock visible; picking a button
-/// commits it as the owner (demoting any previous one).
-fn gesture_owner_selector(
-    capable: &[ButtonId],
-    owner: Option<ButtonId>,
-    view: &Entity<MouseModelView>,
-    pal: Palette,
-) -> impl IntoElement {
-    h_flex()
-        .items_center()
-        .gap_2()
-        .pl(px(SIDE_W + SIDE_GAP))
-        .child(
-            div()
-                .text_caption()
-                .text_color(pal.text_muted)
-                .child(tr!("Gesture Button")),
-        )
-        .children(
-            capable
-                .iter()
-                .map(|&btn| owner_chip(Some(btn), owner, view, pal)),
-        )
-        .child(owner_chip(None, owner, view, pal))
-}
-
-/// One selectable chip in [`gesture_owner_selector`]. Clicking commits the new
-/// gesture owner via [`AppState::commit_gesture_owner`].
-fn owner_chip(
-    btn: Option<ButtonId>,
-    owner: Option<ButtonId>,
-    view: &Entity<MouseModelView>,
-    pal: Palette,
-) -> AnyElement {
-    let selected = btn == owner;
-    let text = match btn {
-        Some(b) => tr!(gesture_owner_label(b)),
-        None => tr!("Off"),
-    };
-    let id_part = btn.map_or(0usize, |b| b as usize + 1);
-    let view = view.clone();
-    div()
-        .id(("gesture-owner", id_part))
-        .px_2()
-        .py_1()
-        .rounded(pal.control_radius)
-        .selected_border(selected, pal)
-        .selected_fill(selected)
-        .text_caption()
-        .text_color(if selected {
-            pal.text_primary
-        } else {
-            pal.text_muted
-        })
-        .when(!selected, |s| s.hover(|s| s.bg(pal.surface_hover)))
-        .cursor_pointer()
-        .child(text)
-        .on_click(move |_event, _window, cx| {
-            cx.update_global::<AppState, _>(|state, _| state.commit_gesture_owner(btn));
-            view.update(cx, |_, vcx| vcx.notify());
-        })
-        .into_any_element()
 }
 
 fn leader_canvas(
@@ -403,7 +294,7 @@ fn breathing_art(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "layout inputs + hover/active/owner state; bundling would just hide the dependency"
+    reason = "layout inputs + hover/active/gesture state; bundling would just hide the dependency"
 )]
 fn hotspots_layer(
     hotspots: &[Hotspot],
@@ -412,7 +303,7 @@ fn hotspots_layer(
     mouse_h: f32,
     hovered: Option<ButtonId>,
     active: Option<ButtonId>,
-    gesture_owner: Option<ButtonId>,
+    gesture_buttons: &[ButtonId],
     view: &Entity<MouseModelView>,
 ) -> impl IntoElement {
     div()
@@ -422,7 +313,14 @@ fn hotspots_layer(
         .w(px(mouse_w))
         .h(px(mouse_h))
         .children(hotspots.iter().enumerate().map(|(idx, hotspot)| {
-            hotspot_popover(idx, *hotspot, hovered, active, gesture_owner, view)
+            hotspot_popover(
+                idx,
+                *hotspot,
+                hovered,
+                active,
+                gesture_buttons.contains(&hotspot.id),
+                view,
+            )
         }))
 }
 
@@ -435,6 +333,7 @@ fn hotspots_layer(
 fn gesture_overview_popover<Tr>(
     popover_id: impl Into<ElementId>,
     anchor: Anchor,
+    btn: ButtonId,
     trigger: Tr,
     view: Entity<MouseModelView>,
 ) -> impl IntoElement
@@ -455,7 +354,7 @@ where
                 });
             }
         })
-        .content(move |_state, _window, cx| gesture_overview(&view, cx))
+        .content(move |_state, _window, cx| gesture_overview(btn, &view, cx))
 }
 
 /// Position the popover wrapper at the label's slot in the side gutter and
@@ -476,7 +375,7 @@ fn label_popover(
     mouse_w: f32,
     hovered: Option<ButtonId>,
     active: Option<ButtonId>,
-    gesture_owner: Option<ButtonId>,
+    is_gesture: bool,
     view: &Entity<MouseModelView>,
 ) -> AnyElement {
     let x = match label.side {
@@ -492,10 +391,11 @@ fn label_popover(
         selected: false,
         view: view.clone(),
     };
-    let popover: AnyElement = if Some(label.id) == gesture_owner {
+    let popover: AnyElement = if is_gesture {
         gesture_overview_popover(
             ("label-popover", idx),
             Anchor::TopLeft,
+            label.id,
             trigger,
             view.clone(),
         )
@@ -710,7 +610,7 @@ fn hotspot_popover(
     hotspot: Hotspot,
     hovered: Option<ButtonId>,
     active: Option<ButtonId>,
-    gesture_owner: Option<ButtonId>,
+    is_gesture: bool,
     view: &Entity<MouseModelView>,
 ) -> AnyElement {
     let view = view.clone();
@@ -721,14 +621,14 @@ fn hotspot_popover(
         view: view.clone(),
         selected: false,
     };
-    // Open the gesture menu only for the button that currently OWNS gestures —
-    // matching the side-label path — so a promoted Middle/Back/Forward opens it
-    // here too, a demoted gesture button opens the plain picker, and (when gestures
-    // are off) no hotspot re-enters the gesture editor.
-    let popover: AnyElement = if Some(hotspot.id) == gesture_owner {
+    // Open the gesture menu for any button in gesture mode — matching the
+    // side-label path — so a promoted Middle/Back/Forward opens it here too and
+    // a demoted button opens the plain picker.
+    let popover: AnyElement = if is_gesture {
         gesture_overview_popover(
             ("hotspot-popover", idx),
             Anchor::TopRight,
+            hotspot.id,
             trigger,
             view.clone(),
         )
@@ -816,18 +716,5 @@ impl RenderOnce for HotspotTrigger {
                     cx.notify();
                 });
             })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gesture_owner_selector_keeps_physical_gesture_button_name() {
-        assert_eq!(
-            gesture_owner_label(ButtonId::GestureButton),
-            "Gesture Button"
-        );
     }
 }
