@@ -237,29 +237,6 @@ impl Config {
             .insert(button, binding);
     }
 
-    /// Returns the gesture sub-bindings for `device_key`'s gesture button, or an
-    /// empty map if it isn't in gesture mode. Derived from the unified
-    /// [`DeviceConfig::bindings`]; kept as a convenience for the agent-side
-    /// per-direction adapter.
-    #[must_use]
-    pub fn gesture_bindings_for(&self, device_key: &str) -> BTreeMap<GestureDirection, Action> {
-        // Read the *owner's* stored map: the gesture role can sit on the
-        // dedicated gesture button or the MX Master 4 haptic panel (or an
-        // OS-hook button — callers gate on the owner kind), and each button
-        // keeps its own per-direction map.
-        let Some(owner) = self.gesture_owner(device_key) else {
-            return BTreeMap::new();
-        };
-        match self
-            .devices
-            .get(device_key)
-            .and_then(|d| d.bindings.get(&owner))
-        {
-            Some(Binding::Gesture(map)) => map.clone(),
-            _ => BTreeMap::new(),
-        }
-    }
-
     /// Records `action` for one `direction` of `button`'s gesture binding,
     /// creating the device entry if needed.
     ///
@@ -313,8 +290,8 @@ impl Config {
 
     /// The single button the pre-v4 owner-locked runtime would have dispatched
     /// gestures from, inferred from the binding shapes — the owner-lock-era
-    /// resolution rule, retained for [`Self::migrate_owner_locked_gestures`]
-    /// and the transition shims. `None` means gestures were off.
+    /// resolution rule, retained solely for
+    /// [`Self::migrate_owner_locked_gestures`]. `None` means gestures were off.
     fn infer_gesture_owner(bindings: &BTreeMap<ButtonId, Binding>) -> Option<ButtonId> {
         // An OS-hook button left in gesture mode took the role over.
         if let Some((id, _)) = bindings
@@ -332,48 +309,6 @@ impl Config {
         }
         // Default: the dedicated HID++ gesture button owns the gesture role.
         Some(ButtonId::GestureButton)
-    }
-
-    /// One gesture-mode button of `device_key`, `None` when nothing gestures.
-    ///
-    /// Transition shim over the shape-driven model for callers still built
-    /// around the retired one-owner lock: when several buttons gesture at once
-    /// (representable since v4) it reports just one, by the owner-lock-era
-    /// preference order. New code reads [`Self::gesture_mode_buttons`].
-    #[must_use]
-    pub fn gesture_owner(&self, device_key: &str) -> Option<ButtonId> {
-        self.devices.get(device_key).map_or(
-            // No config yet → the dedicated HID++ gesture button gestures by default.
-            Some(ButtonId::GestureButton),
-            |device| Self::infer_gesture_owner(&device.bindings),
-        )
-    }
-
-    /// Make `button` the device's sole gesture button.
-    ///
-    /// Transition shim over the shape-driven model preserving the retired
-    /// selector's exclusive semantics: promotes `button` (see
-    /// [`Self::set_gesture_mode`]) and demotes every other gesture-mode button
-    /// to a [`Binding::Single`] of its `Click`. New code sets each button's
-    /// mode independently with [`Self::set_gesture_mode`].
-    pub fn set_gesture_owner(&mut self, device_key: &str, button: ButtonId) {
-        for other in self.gesture_mode_buttons(device_key) {
-            if other != button {
-                self.set_gesture_mode(device_key, other, false);
-            }
-        }
-        self.set_gesture_mode(device_key, button, true);
-    }
-
-    /// Turn every gesture-mode button of `device_key` off.
-    ///
-    /// Transition shim over the shape-driven model: demotes each one via
-    /// [`Self::set_gesture_mode`], which pins the gesture-shaped-by-default
-    /// dedicated button with an explicit `Single`.
-    pub fn disable_gestures(&mut self, device_key: &str) {
-        for button in self.gesture_mode_buttons(device_key) {
-            self.set_gesture_mode(device_key, button, false);
-        }
     }
 
     /// Whether `button` on `device_key` is in gesture mode — a per-button fact
@@ -1419,86 +1354,10 @@ Back = \"BrowserBack\"
     }
 
     #[test]
-    fn gesture_owner_defaults_to_hidpp_button_yields_to_oshook_and_can_be_off() {
-        let mut cfg = Config::default();
-        // Default: the dedicated HID++ gesture button owns the gesture role even with no config.
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-
-        // A dedicated HID++ gesture binding keeps it the owner.
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::MissionControl,
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-
-        // An explicit OS-hook gesture button takes the role over.
-        cfg.set_binding(
-            "2b042",
-            ButtonId::Forward,
-            Binding::Gesture(BTreeMap::from([(GestureDirection::Up, Action::Copy)])),
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::Forward));
-
-        // Turning gestures off explicitly yields `None` (not the HID++ button default).
-        let mut off = Config::default();
-        off.disable_gestures("2b042");
-        assert_eq!(off.gesture_owner("2b042"), None);
-    }
-
-    #[test]
-    fn set_gesture_owner_shim_switches_by_demoting_the_previous_button() {
-        // The transition shim keeps the retired selector's exclusive semantics
-        // on top of the shape-driven model: switching demotes the previous
-        // gesture button to a Single of its Click (no dormant maps — a stored
-        // gesture map always MEANS gesture mode).
-        let mut cfg = Config::default();
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::Copy,
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-
-        cfg.set_binding("2b042", ButtonId::Back, Action::BrowserBack.into());
-        cfg.set_gesture_owner("2b042", ButtonId::Back);
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::Back));
-
-        let bindings = cfg.bindings_for("2b042");
-        // Back is a full five-direction gesture button: its prior single action
-        // stays as Click, and the swipe arms are seeded from defaults.
-        match bindings.get(&ButtonId::Back) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(
-                    map.get(&GestureDirection::Click),
-                    Some(&Action::BrowserBack)
-                );
-                assert_eq!(
-                    map.get(&GestureDirection::Up),
-                    Some(&default_gesture_binding(GestureDirection::Up)),
-                    "a promoted button gets full default arms"
-                );
-            }
-            other => panic!("expected Back to be a gesture binding, got {other:?}"),
-        }
-        // The dedicated button demoted to its Click choice (seeded AppExpose).
-        assert_eq!(
-            bindings.get(&ButtonId::GestureButton),
-            Some(&Binding::Single(default_gesture_binding(
-                GestureDirection::Click
-            ))),
-            "the previous gesture button demotes to its Click"
-        );
-        assert!(!cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
-    }
-
-    #[test]
-    fn set_gesture_owner_seeds_a_fresh_button_with_full_directions() {
+    fn set_gesture_mode_seeds_a_fresh_button_with_full_directions() {
         let mut cfg = Config::default();
         // The dedicated HID++ gesture button gets the full default direction map.
-        cfg.set_gesture_owner("2b042", ButtonId::GestureButton);
+        cfg.set_gesture_mode("2b042", ButtonId::GestureButton, true);
         match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
             Some(Binding::Gesture(map)) => {
                 for dir in GestureDirection::ALL {
@@ -1511,7 +1370,7 @@ Back = \"BrowserBack\"
         // A fresh OS-hook button also gets all five directions, not just a Click:
         // its native action stays as Click, and the swipe arms are defaults — so
         // the GUI's shown defaults are exactly what the runtime dispatches.
-        cfg.set_gesture_owner("2b042", ButtonId::Forward);
+        cfg.set_gesture_mode("2b042", ButtonId::Forward, true);
         match cfg.bindings_for("2b042").get(&ButtonId::Forward) {
             Some(Binding::Gesture(map)) => {
                 assert_eq!(
@@ -1529,31 +1388,9 @@ Back = \"BrowserBack\"
             }
             other => panic!("expected full gesture map for Forward, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn disable_gestures_shim_demotes_every_gesture_button() {
-        // The transition shim's "off" flattens each gesture-mode button to a
-        // Single of its Click — the shape IS the state, so nothing dormant
-        // survives to resurrect unexpectedly.
-        let mut cfg = Config::default();
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::Copy,
-        );
-        cfg.disable_gestures("2b042");
-
-        assert_eq!(cfg.gesture_owner("2b042"), None);
-        assert!(cfg.gesture_mode_buttons("2b042").is_empty());
-        assert_eq!(
-            cfg.bindings_for("2b042").get(&ButtonId::GestureButton),
-            Some(&Binding::Single(default_gesture_binding(
-                GestureDirection::Click
-            ))),
-            "off keeps the map's Click as the button's press"
-        );
+        // Both promotions coexist — no exclusivity.
+        assert!(cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
+        assert!(cfg.is_gesture_mode("2b042", ButtonId::Forward));
     }
 
     #[test]
@@ -1563,7 +1400,7 @@ Back = \"BrowserBack\"
         // the document.
         let mut cfg = Config::default();
         cfg.set_gesture_mode("2b042", ButtonId::Back, true);
-        cfg.disable_gestures("4082d");
+        cfg.set_gesture_mode("4082d", ButtonId::GestureButton, false);
 
         let parsed = write_and_read(&cfg);
         assert!(parsed.is_gesture_mode("2b042", ButtonId::Back));
@@ -1602,8 +1439,9 @@ Back = \"Copy\"
             cfg.bindings_for("2b042").get(&ButtonId::Back),
             Some(&Binding::Single(Action::Copy))
         );
-        // ...and the bad owner degraded to inference (HID++ button default here).
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
+        // ...and the bad owner degraded to inference (HID++ button default here),
+        // so the dedicated button keeps its default gesture mode.
+        assert!(cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
     }
 
     // ── Shape-driven gesture mode (the owner lock removed) ──
