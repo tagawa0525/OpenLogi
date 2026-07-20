@@ -358,6 +358,46 @@ impl Config {
             .gesture_owner = Some(GestureOwner::Off);
     }
 
+    /// Whether `button` on `device_key` is in gesture mode — a per-button fact
+    /// read straight from the binding shape: a stored [`Binding::Gesture`], or
+    /// no stored binding on a button whose canonical default
+    /// ([`default_binding_for`]) is gesture-shaped (the dedicated HID++ gesture
+    /// button starts in gesture mode).
+    ///
+    /// Gesture mode is not exclusive: any number of buttons may gesture at
+    /// once, each with its own direction map. This replaces the former
+    /// one-gesture-button-per-device owner lock — see [`Self::set_gesture_mode`].
+    #[must_use]
+    pub fn is_gesture_mode(&self, device_key: &str, button: ButtonId) -> bool {
+        let _ = (device_key, button);
+        false
+    }
+
+    /// Every button of `device_key` currently in gesture mode, in [`ButtonId`]
+    /// declaration order. Purely config-derived: callers cross it with the
+    /// device's actual controls (a model without the dedicated gesture button
+    /// simply never captures it).
+    #[must_use]
+    pub fn gesture_mode_buttons(&self, device_key: &str) -> Vec<ButtonId> {
+        let _ = device_key;
+        Vec::new()
+    }
+
+    /// Turn gesture mode on or off for one button, independently of every
+    /// other button.
+    ///
+    /// On: promote the stored binding in place ([`Binding::upgrade_to_gesture`]
+    /// keeps a prior single action as the [`GestureDirection::Click`] entry)
+    /// and seed unbound directions from
+    /// [`default_gesture_binding`](crate::binding::default_gesture_binding).
+    /// Off: demote to a [`Binding::Single`] of the map's `Click` action,
+    /// falling back to the button's canonical
+    /// [`default_binding`](crate::binding::default_binding) when the map has no
+    /// explicit `Click` — a demoted button always keeps a meaningful press.
+    pub fn set_gesture_mode(&mut self, device_key: &str, button: ButtonId, enabled: bool) {
+        let _ = (device_key, button, enabled);
+    }
+
     /// Resolve the effective binding map for `device_key`, overlaying the
     /// per-app entry for `bundle_id` (if any) on top of the global per-device
     /// `bindings`. A per-app override replaces the whole button with a
@@ -1480,5 +1520,177 @@ Back = \"Copy\"
         );
         // ...and the bad owner degraded to inference (HID++ button default here).
         assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
+    }
+
+    // ── Shape-driven gesture mode (the owner lock removed) ──
+
+    #[test]
+    #[ignore = "RED: shape-driven gesture mode not implemented yet"]
+    fn gesture_mode_is_per_button_and_not_exclusive() {
+        // The owner lock is gone: promoting a second button must not demote the
+        // dedicated gesture button's default gesture mode.
+        let mut cfg = Config::default();
+        cfg.set_gesture_mode("2b042", ButtonId::MiddleClick, true);
+
+        assert!(cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
+        assert!(cfg.is_gesture_mode("2b042", ButtonId::MiddleClick));
+        let buttons = cfg.gesture_mode_buttons("2b042");
+        assert!(
+            buttons.contains(&ButtonId::GestureButton),
+            "got: {buttons:?}"
+        );
+        assert!(buttons.contains(&ButtonId::MiddleClick), "got: {buttons:?}");
+    }
+
+    #[test]
+    #[ignore = "RED: shape-driven gesture mode not implemented yet"]
+    fn set_gesture_mode_on_keeps_click_and_seeds_directions() {
+        // Promoting a single-bound button keeps its action as the Click entry
+        // and seeds every swipe arm, so the button exposes the full five-way set.
+        let mut cfg = Config::default();
+        cfg.set_binding("2b042", ButtonId::Back, Binding::Single(Action::Copy));
+        cfg.set_gesture_mode("2b042", ButtonId::Back, true);
+
+        let bindings = cfg.bindings_for("2b042");
+        let Some(Binding::Gesture(map)) = bindings.get(&ButtonId::Back) else {
+            panic!(
+                "expected a gesture binding, got {:?}",
+                bindings.get(&ButtonId::Back)
+            );
+        };
+        assert_eq!(map.get(&GestureDirection::Click), Some(&Action::Copy));
+        for dir in [
+            GestureDirection::Up,
+            GestureDirection::Down,
+            GestureDirection::Left,
+            GestureDirection::Right,
+        ] {
+            assert_eq!(
+                map.get(&dir),
+                Some(&default_gesture_binding(dir)),
+                "unseeded arm {dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "RED: shape-driven gesture mode not implemented yet"]
+    fn set_gesture_mode_off_demotes_to_the_click_action() {
+        let mut cfg = Config::default();
+        cfg.set_gesture_direction(
+            "2b042",
+            ButtonId::GestureButton,
+            GestureDirection::Click,
+            Action::Paste,
+        );
+        cfg.set_gesture_mode("2b042", ButtonId::GestureButton, false);
+
+        assert!(!cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
+        assert_eq!(
+            cfg.bindings_for("2b042").get(&ButtonId::GestureButton),
+            Some(&Binding::Single(Action::Paste))
+        );
+    }
+
+    #[test]
+    #[ignore = "RED: shape-driven gesture mode not implemented yet"]
+    fn set_gesture_mode_off_without_click_falls_back_to_the_default() {
+        // A sparse hand-edited map with no Click must not demote to a dead
+        // Single(None) — the button falls back to its canonical single default.
+        let mut cfg = Config::default();
+        let mut map = BTreeMap::new();
+        map.insert(GestureDirection::Up, Action::Copy);
+        cfg.set_binding("2b042", ButtonId::Back, Binding::Gesture(map));
+        cfg.set_gesture_mode("2b042", ButtonId::Back, false);
+
+        assert_eq!(
+            cfg.bindings_for("2b042").get(&ButtonId::Back),
+            Some(&Binding::Single(Action::BrowserBack))
+        );
+    }
+
+    #[test]
+    #[ignore = "RED: shape-driven gesture mode not implemented yet"]
+    fn migration_demotes_the_dormant_non_owner_gesture_maps() {
+        // An owner-locked config: Middle owns gestures; the dedicated button
+        // keeps a dormant map from an earlier reign. Shape-driven load keeps the
+        // owner gesturing and flattens the dormant map to its Click, so a stored
+        // map's presence always MEANS gesture mode.
+        let toml = "\
+schema_version = 3
+
+[devices.2b042]
+gesture_owner = \"MiddleClick\"
+
+[devices.2b042.bindings]
+GestureButton = { Up = \"Copy\", Click = \"Paste\" }
+MiddleClick = { Up = \"MissionControl\", Click = \"MiddleClick\" }
+";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, toml).expect("write");
+
+        let cfg = Config::load_from_path(&path).expect("load");
+        assert!(cfg.is_gesture_mode("2b042", ButtonId::MiddleClick));
+        assert!(!cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
+        assert_eq!(
+            cfg.bindings_for("2b042").get(&ButtonId::GestureButton),
+            Some(&Binding::Single(Action::Paste)),
+            "the dormant map demotes to its Click choice"
+        );
+        // The legacy field is gone on save — the binding shape is the whole truth.
+        let body = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(!body.contains("gesture_owner"), "got: {body}");
+    }
+
+    #[test]
+    #[ignore = "RED: shape-driven gesture mode not implemented yet"]
+    fn migration_off_pins_the_dedicated_button_out_of_gesture_mode() {
+        // gesture_owner = "Off" with no stored bindings: absence would re-enter
+        // default gesture mode under shape rules, so the load pins the dedicated
+        // button with an explicit Single at its canonical default (which the
+        // capture layer treats as native/undiverted).
+        let toml = "\
+schema_version = 3
+
+[devices.2b042]
+gesture_owner = \"Off\"
+";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, toml).expect("write");
+
+        let cfg = Config::load_from_path(&path).expect("load");
+        assert!(!cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
+        assert!(cfg.gesture_mode_buttons("2b042").is_empty());
+        assert_eq!(
+            cfg.bindings_for("2b042").get(&ButtonId::GestureButton),
+            Some(&Binding::Single(default_binding(ButtonId::GestureButton)))
+        );
+    }
+
+    #[test]
+    #[ignore = "RED: shape-driven gesture mode not implemented yet"]
+    fn migration_infers_the_owner_for_pre_field_configs() {
+        // Pre-owner-field file: a gesture-shaped OS-hook button was the owner by
+        // inference, silencing the dedicated button. The load preserves exactly
+        // that: Back keeps gesturing, the dedicated button is pinned off.
+        let toml = "\
+schema_version = 2
+
+[devices.2b042.bindings]
+Back = { Up = \"Copy\" }
+";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, toml).expect("write");
+
+        let cfg = Config::load_from_path(&path).expect("load");
+        assert!(cfg.is_gesture_mode("2b042", ButtonId::Back));
+        assert!(!cfg.is_gesture_mode("2b042", ButtonId::GestureButton));
+        assert_eq!(
+            cfg.bindings_for("2b042").get(&ButtonId::GestureButton),
+            Some(&Binding::Single(default_binding(ButtonId::GestureButton)))
+        );
     }
 }
