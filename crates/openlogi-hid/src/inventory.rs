@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -18,6 +19,7 @@ use crate::transport::{enumerate_hidpp_devices, open_hidpp_channel};
 
 mod cache;
 mod features;
+mod persist;
 mod probe;
 
 use cache::{CACHE_MISS_GRACE, CacheKey, CacheOutcome, Cached};
@@ -38,13 +40,15 @@ const MAX_BOLT_SLOTS: u8 = 6;
 /// device wedges the whole enumeration — and the GUI runs `enumerate` on a
 /// polling watcher, so a permanent hang would stall every later refresh.
 ///
-/// Kept short so a snapshot settles quickly: a timed-out node is skipped and
-/// re-probed on the next watcher tick (~2 s), and the first probe usually wakes
-/// the device so the retry succeeds fast. Slots are probed concurrently on both
-/// receiver paths, so a healthy receiver's worst case is the 1.5 s arrival drain
-/// plus a single slot's [`BOLT_SLOT_PROBE`] / [`UNIFYING_SLOT_PROBE`] — not their
-/// sum — which this stays comfortably above, so awake devices never trip it.
-const PROBE_BUDGET: Duration = Duration::from_secs(6);
+/// Sized to contain the worst case rather than the healthy one: a healthy
+/// node still settles in a couple of seconds (this is a ceiling, not a wait),
+/// but the budget must cover the 1.5 s Bolt arrival drain, the sequential
+/// register pass, and one full [`BOLT_SLOT_PROBE`] / [`UNIFYING_SLOT_PROBE`] —
+/// the per-slot walks run concurrently on both receiver paths, so the worst
+/// case is the slowest slot, not the sum. A timed-out node is skipped (the
+/// ledger replays its last good snapshot) and re-probed on the next watcher
+/// tick.
+const PROBE_BUDGET: Duration = Duration::from_secs(15);
 
 /// Per-slot budget for the HID++ 2.0 feature walk on a Unifying paired device.
 ///
@@ -60,22 +64,20 @@ const UNIFYING_SLOT_PROBE: Duration = Duration::from_millis(3500);
 
 /// Per-slot budget for the HID++ 2.0 feature walk on a Bolt paired device.
 ///
-/// Without a per-slot cap a single online device that stops answering its
-/// feature-walk reads burns the whole receiver's [`PROBE_BUDGET`], so
-/// `probe_one` times out and the receiver yields *nothing* — every paired device
-/// drops to "No devices" even though its pairing-register identity read fine
-/// (#218). Capping each slot lets a hung device fall back to its cached /
-/// identity-only data while the rest of the receiver still enumerates, mirroring
-/// [`UNIFYING_SLOT_PROBE`].
-///
-/// Bolt slots are probed concurrently (see `probe_bolt_receiver`), so this cap
-/// bounds each slot independently and does *not* sum across slots — the receiver
-/// cycle is the arrival drain plus the single slowest slot. 3 s is generous
-/// headroom for a healthy walk: a feature-rich device enumerates a large table
-/// one round-trip per feature, and the MX Master 4 (45 features over Bolt) takes
-/// ~1–1.6 s even awake. The previous 1 s cap cut that walk off every tick, so
-/// the device surfaced permanently with no capabilities or battery.
-const BOLT_SLOT_PROBE: Duration = Duration::from_secs(3);
+/// Bounds a single device that stops answering its feature-walk reads (seen on
+/// a recent macOS IOHID stack with a new MX Master 4) so it falls back to its
+/// cached / identity-only data instead of pinning its slot future forever
+/// (#218). Slots walk *concurrently* (mirroring the Unifying path), so this
+/// budget covers the slowest single slot rather than dividing [`PROBE_BUDGET`]
+/// across the slot count. A healthy walk is not always fast either: a
+/// feature-rich device enumerates a large table one round-trip per feature
+/// (the MX Master 4's 45 features take ~1–1.6 s over Bolt even awake), and on
+/// high-latency USB paths (a Bolt receiver behind a KVM's USB emulation) it
+/// takes several seconds — the earlier 1 s cap starved every slot there, so a
+/// newly paired device could never acquire model info at all. 10 s is generous
+/// headroom for degraded-but-alive paths while still fitting [`PROBE_BUDGET`]
+/// after the 1.5 s arrival drain and the register pass.
+const BOLT_SLOT_PROBE: Duration = Duration::from_secs(10);
 
 /// Errors raised while enumerating HID++ devices.
 #[derive(Debug, Error)]
@@ -106,6 +108,12 @@ pub struct Enumerator {
     /// cached channel must be dropped and reopened (see [`crate::node_ledger`]).
     ledger: NodeLedger<async_hid::DeviceId>,
     tick: u64,
+    /// Where the immutable probe cache is persisted across restarts, `None`
+    /// for a memory-only enumerator (one-shot CLI calls, tests).
+    persist_path: Option<PathBuf>,
+    /// Whether the persistable cache content changed since the last save —
+    /// fresh full probes and evictions, not per-tick battery refreshes.
+    cache_dirty: bool,
 }
 
 /// An open channel to a receiver / direct-device HID node, held across
@@ -204,6 +212,49 @@ const ONESHOT_ATTEMPTS: u8 = 4;
 const ONESHOT_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 impl Enumerator {
+    /// An enumerator whose immutable probe cache is warm-started from (and
+    /// written back to) the on-disk cache under the app data dir, so a device
+    /// fully probed once keeps its identity across restarts. Falls back to
+    /// memory-only when no data dir is resolvable.
+    #[must_use]
+    pub fn with_persistence() -> Self {
+        let persist_path = match openlogi_core::paths::data_dir() {
+            Ok(dir) => Some(dir.join("probe-cache.json")),
+            Err(e) => {
+                warn!(error = %e, "no data dir — probe cache is memory-only");
+                None
+            }
+        };
+        let cache = persist_path
+            .as_deref()
+            .map(persist::load)
+            .unwrap_or_default();
+        if !cache.is_empty() {
+            debug!(entries = cache.len(), "probe cache warm-started from disk");
+        }
+        Self {
+            cache,
+            persist_path,
+            ..Self::default()
+        }
+    }
+
+    /// Write the cache through to disk when its persistable content changed
+    /// this tick. Best-effort: a failed write is logged and retried on the
+    /// next dirty tick.
+    fn flush_cache(&mut self) {
+        if !self.cache_dirty {
+            return;
+        }
+        let Some(path) = self.persist_path.as_deref() else {
+            return;
+        };
+        match persist::save(path, &self.cache) {
+            Ok(()) => self.cache_dirty = false,
+            Err(e) => warn!(error = %e, ?path, "failed to persist probe cache"),
+        }
+    }
+
     /// One enumeration pass, reusing the cache from prior passes. Probes every
     /// HID candidate concurrently (so one asleep node that burns the whole
     /// `PROBE_BUDGET` can't stall the others), reusing each device's cached
@@ -336,7 +387,15 @@ impl Enumerator {
         let mut seen_keys = HashSet::new();
         for outcome in outcomes {
             match outcome {
-                CacheOutcome::Fresh(key, cached) | CacheOutcome::Update(key, cached) => {
+                CacheOutcome::Fresh(key, cached) => {
+                    seen_keys.insert(key.clone());
+                    self.cache.insert(key, cached);
+                    // A completed full probe is worth writing through; battery
+                    // `Update`s are not (they would rewrite the file every
+                    // tick for a value that is re-read live anyway).
+                    self.cache_dirty = true;
+                }
+                CacheOutcome::Update(key, cached) => {
                     seen_keys.insert(key.clone());
                     self.cache.insert(key, cached);
                 }
@@ -347,6 +406,7 @@ impl Enumerator {
             }
         }
         self.evict_unseen(&seen_keys);
+        self.flush_cache();
         Ok((inventories, all_complete, all_healthy))
     }
 
@@ -368,10 +428,12 @@ impl Enumerator {
             if *misses > CACHE_MISS_GRACE {
                 self.cache.remove(&key);
                 self.misses.remove(&key);
+                self.cache_dirty = true;
             }
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, reason = "expect/unwrap are idiomatic in tests")]
 mod tests;
