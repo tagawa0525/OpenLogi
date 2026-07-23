@@ -79,8 +79,18 @@ struct CaptureAccum {
     /// The gesture source that began the current hold, with the [`ButtonId`]
     /// its events dispatch as. Raw-XY reports carry no source attribution, so
     /// the first held source owns the accumulated motion until it is released
-    /// (first hold wins); another source pressed mid-hold is ignored.
+    /// (first hold wins). While a second source is held alongside it, motion
+    /// is dropped instead of miscommitted (see [`Self::overlap`]); when the
+    /// holder releases, a still-held source takes the hold over.
     gesture_source: Option<(u16, ButtonId)>,
+    /// Whether a second armed source is held alongside the holder. Raw-XY
+    /// reports are unattributed on the wire, so overlap motion could belong to
+    /// either control — it is dropped until the overlap ends.
+    overlap: bool,
+    /// The armed gesture sources held in the last event, for edge detection:
+    /// a source not previously held that becomes the holder is a fresh touch
+    /// (the haptic panel's first sample is then a contact jump to discard).
+    gestures_down: Vec<u16>,
     /// Whether the current hold's next raw-XY sample must be dropped: the
     /// haptic panel's first sample after contact is an absolute position
     /// jump, not a delta (see [`reprog_controls::HAPTIC_PANEL_CID`]).
@@ -268,10 +278,15 @@ impl ArmedControls {
 }
 
 /// Resolve features off the device's root and divert the controls `spec`
-/// selects: the gesture button (raw-XY), DPI/ModeShift buttons and rebindable
+/// selects: the gesture sources (raw-XY), DPI/ModeShift buttons and rebindable
 /// standard buttons over `0x1b04`, and the thumb wheel over `0x2150`. The
 /// root-feature lookup mirrors `write::open_feature`,
 /// since hidpp 0.2's registry doesn't carry the features OpenLogi reimplements.
+///
+/// A failure mid-way hands every already-diverted control back to the firmware
+/// before returning: with several controls armed one after another, aborting
+/// without disarming would leave the earlier ones diverted with no session
+/// listening — captured-and-dropped until a later respawn succeeds.
 async fn arm_controls(
     chan: &Arc<HidppChannel>,
     slot: u8,
@@ -281,10 +296,38 @@ async fn arm_controls(
         .await
         .map_err(|_| GestureError::DeviceUnreachable(slot))?;
 
-    let mut reprog: Option<(ReprogControlsV4, u8)> = None;
-    let mut gesture_cids: Vec<u16> = Vec::new();
-    let mut dpi_cids: Vec<u16> = Vec::new();
-    let mut button_cids: Vec<(u16, ButtonId)> = Vec::new();
+    let mut armed = ArmedControls {
+        reprog: None,
+        gesture_cids: Vec::new(),
+        dpi_cids: Vec::new(),
+        button_cids: Vec::new(),
+        thumb: None,
+    };
+    if let Err(e) = arm_controls_inner(chan, slot, spec, &device, &mut armed).await {
+        armed.disarm().await;
+        return Err(e);
+    }
+
+    if armed.gesture_cids.is_empty()
+        && armed.dpi_cids.is_empty()
+        && armed.button_cids.is_empty()
+        && armed.thumb.is_none()
+    {
+        debug!(slot, "no capturable controls — idle session");
+    }
+    Ok(armed)
+}
+
+/// The fallible arming steps of [`arm_controls`], recording each successful
+/// divert into `armed` as it lands — so the caller can disarm exactly what was
+/// armed when a later step fails.
+async fn arm_controls_inner(
+    chan: &Arc<HidppChannel>,
+    slot: u8,
+    spec: &CaptureSpec,
+    device: &Device,
+    armed: &mut ArmedControls,
+) -> Result<(), GestureError> {
     if let Some(info) = device
         .root()
         .get_feature(reprog_controls::FEATURE_ID)
@@ -293,6 +336,12 @@ async fn arm_controls(
     {
         let rc = ReprogControlsV4::new(Arc::clone(chan), slot, info.index);
         let controls = enumerate_controls(&rc).await?;
+        // Register an accessor before the first divert, so a failure on any
+        // divert (including the first) can be handed back via `disarm`.
+        armed.reprog = Some((
+            ReprogControlsV4::new(Arc::clone(chan), slot, info.index),
+            info.index,
+        ));
 
         // Divert each gesture-mode source; a source not listed stays native
         // (an idle HID++ control must not be captured-and-dropped).
@@ -301,7 +350,7 @@ async fn arm_controls(
                 rc.set_cid_reporting(cid, true, true)
                     .await
                     .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
-                gesture_cids.push(cid);
+                armed.gesture_cids.push(cid);
             }
         }
         for &cid in &reprog_controls::DPI_MODE_SHIFT_CIDS {
@@ -309,27 +358,25 @@ async fn arm_controls(
                 rc.set_cid_reporting(cid, true, false)
                     .await
                     .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
-                dpi_cids.push(cid);
+                armed.dpi_cids.push(cid);
             }
         }
         for &(cid, button) in &spec.divert_buttons {
             // The plan never lists a raw-XY-diverted gesture source, but
             // guard anyway: a plain (divert, no raw-XY) write here would strip
             // the raw-XY reporting armed above.
-            if gesture_cids.contains(&cid) {
+            if armed.gesture_cids.contains(&cid) {
                 continue;
             }
             if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
                 rc.set_cid_reporting(cid, true, false)
                     .await
                     .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
-                button_cids.push((cid, button));
+                armed.button_cids.push((cid, button));
             }
         }
-        reprog = Some((rc, info.index));
     }
 
-    let mut thumb: Option<(Thumbwheel, u8)> = None;
     if spec.capture_thumbwheel
         && let Some(info) = device
             .root()
@@ -358,19 +405,9 @@ async fn arm_controls(
         tw.set_reporting(true, false)
             .await
             .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
-        thumb = Some((tw, info.index));
+        armed.thumb = Some((tw, info.index));
     }
-
-    if gesture_cids.is_empty() && dpi_cids.is_empty() && button_cids.is_empty() && thumb.is_none() {
-        debug!(slot, "no capturable controls — idle session");
-    }
-    Ok(ArmedControls {
-        reprog,
-        gesture_cids,
-        dpi_cids,
-        button_cids,
-        thumb,
-    })
+    Ok(())
 }
 
 /// The [`ButtonId`] a gesture-source CID dispatches as, per
@@ -429,30 +466,45 @@ fn handle_reprog(
             // When a gesture-source control is instead diverted as a plain
             // button (a single binding, not gesture mode), its press must flow
             // through the `button_cids` loop only — not also emit a click.
+            let held: Vec<(u16, ButtonId)> = gesture_cids
+                .iter()
+                .filter(|cid| cids.contains(cid))
+                .filter_map(|&cid| gesture_source_button(cid).map(|b| (cid, b)))
+                .collect();
             match acc.gesture_source {
-                None => {
-                    if let Some((cid, button)) = gesture_cids
-                        .iter()
-                        .filter(|cid| cids.contains(cid))
-                        .find_map(|&cid| gesture_source_button(cid).map(|b| (cid, b)))
-                    {
-                        acc.gesture_source = Some((cid, button));
-                        acc.swipe.begin();
-                        acc.skip_first_raw_xy = cid == reprog_controls::HAPTIC_PANEL_CID;
-                    }
+                Some((cid, _)) if cids.contains(&cid) => {
+                    // The holder is still down. While a second armed source is
+                    // held alongside it, unattributed raw-XY motion is dropped
+                    // (see `CaptureAccum::overlap`).
+                    acc.overlap = held.len() > 1;
                 }
-                Some((cid, button)) => {
-                    if !cids.contains(&cid) {
+                previous => {
+                    // No holder, or the holder released: a released hold that
+                    // never committed a direction is a plain click...
+                    if let Some((_, button)) = previous {
                         acc.gesture_source = None;
-                        // A press that never committed a direction is a plain click.
+                        acc.overlap = false;
                         if acc.swipe.end() {
                             debug!(%button, "gesture click");
                             let _ =
                                 sink.send(CapturedInput::Gesture(button, GestureDirection::Click));
                         }
                     }
+                    // ...and the first still-held source begins (or takes
+                    // over) the hold. A source not down in the previous event
+                    // is a fresh touch, so the panel's contact-jump discard
+                    // applies; one that was already held has had its jump
+                    // dropped during the overlap.
+                    if let Some(&(cid, button)) = held.first() {
+                        acc.gesture_source = Some((cid, button));
+                        acc.swipe.begin();
+                        acc.overlap = held.len() > 1;
+                        acc.skip_first_raw_xy = cid == reprog_controls::HAPTIC_PANEL_CID
+                            && !acc.gestures_down.contains(&cid);
+                    }
                 }
             }
+            acc.gestures_down = held.into_iter().map(|(cid, _)| cid).collect();
 
             let dpi_down = dpi_cids.iter().any(|cid| cids.contains(cid));
             if dpi_down && !acc.dpi_down {
@@ -477,6 +529,12 @@ fn handle_reprog(
             let Some((_, button)) = acc.gesture_source else {
                 return;
             };
+            // While two armed sources are held the report could belong to
+            // either control — drop it rather than miscommit a swipe through
+            // the holder's map.
+            if acc.overlap {
+                return;
+            }
             // The haptic panel's first sample after contact is a position
             // jump; summing it would commit a bogus direction instantly.
             if acc.skip_first_raw_xy {
