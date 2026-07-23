@@ -52,7 +52,7 @@ use crate::state::devices::{
     adopt_transient_record, build_device_list, direct_key_prefix, pick_initial_device,
     sort_device_list,
 };
-use openlogi_agent_core::bindings::{bindings_for, hidpp_gesture_maps_for};
+use openlogi_agent_core::bindings::{bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
 use openlogi_agent_core::device_order::PhysicalDeviceKey;
 
 /// Default DPI value applied to a fresh AppState. Matches a common Logitech
@@ -1415,18 +1415,12 @@ impl AppState {
         else {
             return BTreeMap::new();
         };
-        // HID++ sources come seeded, matching the gesture watcher's projection.
+        // Both halves come from the same helpers the runtime dispatches with,
+        // so the menus can never drift from what the agent actually does:
+        // HID++ sources seeded like the gesture watcher, OS-hook buttons raw
+        // like the hook (global view — no per-app overlay here).
         let mut maps = hidpp_gesture_maps_for(&self.config, Some(key));
-        // A gesture-mode OS-hook button shows its raw stored map (which
-        // `set_gesture_mode` seeds with full defaults), so the menu matches
-        // exactly what `oshook_gestures_for` dispatches — no seeding here.
-        for (id, binding) in self.config.bindings_for(key) {
-            if id.is_os_hook_button()
-                && let Binding::Gesture(map) = binding
-            {
-                maps.insert(id, map);
-            }
-        }
+        maps.extend(oshook_gestures_for(&self.config, Some(key), None));
         maps
     }
 
