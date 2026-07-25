@@ -129,7 +129,9 @@ pub fn spawn(period: Duration) -> mpsc::UnboundedReceiver<InventoryEvent> {
             // A persistent enumerator so its per-device probe cache survives
             // across ticks — a known device's immutable data (model, features)
             // is reused instead of being re-handshaked every poll.
-            let mut enumerator = openlogi_hid::Enumerator::default();
+            // Warm-start from the persisted probe cache so devices keep
+            // their identity across agent restarts without a fresh interview.
+            let mut enumerator = openlogi_hid::Enumerator::with_persistence();
             let mut state = WatchState::default();
             let mut last_tick = SystemTime::now();
             // `block_on` installs runtime context so a backend that registers an

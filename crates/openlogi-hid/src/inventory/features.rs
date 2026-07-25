@@ -12,6 +12,7 @@ use hidpp::{
 use openlogi_core::device::{
     BatteryInfo, Capabilities, DeviceKind, DeviceModelInfo, DeviceTransports,
 };
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::mappings::{
@@ -20,7 +21,7 @@ use crate::mappings::{
 
 /// Everything a single device probe yields. Any field is `None` when the
 /// device doesn't expose that feature or the read failed.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub(super) struct ProbedFeatures {
     pub(super) battery: Option<BatteryInfo>,
     pub(super) model_info: Option<DeviceModelInfo>,
