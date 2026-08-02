@@ -19,14 +19,14 @@
 //! the events arrive over HID++, and the bound action is synthesised the same
 //! way regardless.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use openlogi_core::binding::{Action, ButtonId, GestureDirection, default_binding};
+use openlogi_core::binding::{Action, ButtonId, default_binding};
 use openlogi_core::config::DEFAULT_THUMBWHEEL_SENSITIVITY;
-use openlogi_hid::gesture::CaptureSpec;
+use openlogi_hid::gesture::{CaptureSpec, GESTURE_SOURCE_BUTTONS};
 use openlogi_hid::{CaptureChannel, CapturedInput, DeviceRoute, run_capture_session};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
@@ -35,10 +35,6 @@ use crate::DpiCycles;
 use crate::capture_plan::{DeviceCapturePlan, SharedCapturePlans};
 use crate::hook_runtime;
 use crate::receiver_access::{CaptureReceiverLease, ReceiverAccess};
-
-/// Shared gesture-direction binding map, mirrored from `AppState` (keyed by
-/// direction). The watcher reads it to map a captured swipe to a bound action.
-pub type GestureBindings = Arc<RwLock<BTreeMap<GestureDirection, Action>>>;
 
 /// How often to re-read the active device target + thumb-wheel arming so a
 /// carousel switch or a binding/sensitivity edit re-points / re-arms capture.
@@ -111,7 +107,13 @@ fn thumbwheel_armed(plan: &DeviceCapturePlan) -> bool {
 fn spec_for(plan: &DeviceCapturePlan) -> CaptureSpec {
     CaptureSpec {
         capture_thumbwheel: thumbwheel_armed(plan),
-        divert_gesture_source: plan.gesture_source_cid,
+        // Derived from the dispatch maps, so the armed diverts and the maps
+        // resolving their events can never drift apart.
+        divert_gesture_sources: GESTURE_SOURCE_BUTTONS
+            .into_iter()
+            .filter(|(_, button)| plan.gesture_bindings.contains_key(button))
+            .map(|(cid, _)| cid)
+            .collect(),
         divert_buttons: plan.divert_buttons.clone(),
     }
 }
@@ -385,12 +387,16 @@ fn dispatch(
         return;
     };
     match input {
-        CapturedInput::Gesture(direction) => {
-            if let Some(action) = plan.gesture_bindings.get(&direction) {
-                debug!(key, ?direction, action = %action.label(), "gesture → action");
+        CapturedInput::Gesture(button, direction) => {
+            if let Some(action) = plan
+                .gesture_bindings
+                .get(&button)
+                .and_then(|map| map.get(&direction))
+            {
+                debug!(key, %button, ?direction, action = %action.label(), "gesture → action");
                 hook_runtime::dispatch_action(action, dpi_cycle, Some(key), capture);
             } else {
-                debug!(key, ?direction, "gesture with no binding — ignored");
+                debug!(key, %button, ?direction, "gesture with no binding — ignored");
             }
         }
         CapturedInput::ButtonPressed(button) => {

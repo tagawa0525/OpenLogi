@@ -157,6 +157,8 @@ _version: 1
 "DPI Toggle": "Cambia DPI"
 "Thumb Wheel": "Volante da pollice"
 "Gesture Button": "Pulsante gesture"
+"Gestures": "Gesture"
+"Turn off gestures": "Disattiva le gesture"
 "Haptic Panel": "Pannello aptico"
 "Up": "Su"
 "Down": "Giù"

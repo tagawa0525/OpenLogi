@@ -16,7 +16,7 @@ use openlogi_core::config::Config;
 use openlogi_hid::DeviceRoute;
 use openlogi_hid::gesture::{DIVERTABLE_STANDARD_BUTTONS, GESTURE_SOURCE_BUTTONS};
 
-use crate::bindings::{bindings_for, gesture_bindings_for, oshook_gestures_for};
+use crate::bindings::{bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
 
 /// Everything the capture watcher needs to run one device's session and
 /// dispatch its events.
@@ -28,13 +28,11 @@ pub struct DeviceCapturePlan {
     pub route: DeviceRoute,
     /// Per-button single actions for this device (per-app effective).
     pub bindings: BTreeMap<ButtonId, Action>,
-    /// Per-direction map when a HID++ gesture source (the dedicated gesture
-    /// button or the MX Master 4 haptic panel) owns the gesture role on this
-    /// device; empty otherwise.
-    pub gesture_bindings: BTreeMap<GestureDirection, Action>,
-    /// The gesture owner's source CID to divert with raw-XY, `None` when no
-    /// HID++ control owns the gesture role.
-    pub gesture_source_cid: Option<u16>,
+    /// Per-direction map for each HID++ gesture source (the dedicated gesture
+    /// button, the MX Master 4 haptic panel) in gesture mode on this device,
+    /// keyed by the button its captured swipes dispatch as; empty when none
+    /// gestures.
+    pub gesture_bindings: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
     /// Standard buttons whose binding leaves the default — divert over
     /// `0x1b04`. A button at its default keeps its native HID behavior, so no
     /// re-synthesis is ever needed.
@@ -59,28 +57,21 @@ pub fn plan_for_device(
     app: Option<&str>,
 ) -> DeviceCapturePlan {
     let bindings = bindings_for(config, Some(config_key), app);
-    let gesture_bindings = gesture_bindings_for(config, Some(config_key));
-    // A button acting as the OS-hook gesture owner must stay native: the hook
-    // needs to see its press to run hold+swipe detection, and diverting it
-    // would starve the hook of events.
+    // A gesture-mode OS-hook button must stay native: the hook needs to see
+    // its press to run hold+swipe detection, and diverting it would starve the
+    // hook of events.
     let oshook = oshook_gestures_for(config, Some(config_key), app);
+    // One direction map per HID++ source in gesture mode — several may
+    // gesture at once, each armed with its own raw-XY divert (the watcher
+    // derives the CIDs to divert from this map's keys).
+    let gesture_bindings = hidpp_gesture_maps_for(config, Some(config_key));
     // The HID++ gesture sources never reach the OS hook, so a non-default
     // single binding on one is deliverable only via a plain HID++ divert — but
-    // only while it does NOT own the gesture role (the raw-XY gesture divert
-    // owns the owner's CID, and `gesture_source_cid` is how the watcher arms
-    // that divert).
-    let owner = config.gesture_owner(config_key);
-    let gesture_source_cid = owner
-        .filter(|o| o.is_hidpp_gesture_source())
-        .and_then(|o| {
-            GESTURE_SOURCE_BUTTONS
-                .into_iter()
-                .find(|&(_, button)| button == o)
-        })
-        .map(|(cid, _)| cid);
+    // only while the source is NOT in gesture mode (the raw-XY gesture divert
+    // owns a gesturing source's CID).
     let plain_sources = GESTURE_SOURCE_BUTTONS
         .into_iter()
-        .filter(|&(_, button)| owner != Some(button));
+        .filter(|(_, button)| !gesture_bindings.contains_key(button));
     let divert_buttons: Vec<(u16, ButtonId)> = DIVERTABLE_STANDARD_BUTTONS
         .into_iter()
         .chain(plain_sources)
@@ -107,7 +98,6 @@ pub fn plan_for_device(
         route,
         bindings,
         gesture_bindings,
-        gesture_source_cid,
         divert_buttons,
         thumbwheel_bindings_nondefault,
         thumbwheel_sensitivity: config.thumbwheel_sensitivity(config_key),
@@ -129,30 +119,55 @@ mod tests {
     }
 
     #[test]
-    fn haptic_panel_can_own_the_gesture_role() {
-        // The MX Master 4 haptic panel is a HID++ gesture source: selecting it
-        // as the gesture owner must arm the raw-XY gesture divert, exactly
-        // like the dedicated gesture button.
+    fn both_hidpp_sources_gesture_when_both_are_in_gesture_mode() {
+        // On MX Master 4 the dedicated button and the haptic panel can gesture
+        // at the same time: the plan arms a raw-XY divert for each and keeps
+        // both out of the plain-divert list.
         let mut cfg = Config::default();
-        cfg.set_gesture_owner("2b042", ButtonId::HapticPanel);
+        cfg.set_gesture_mode("2b042", ButtonId::GestureButton, true);
+        cfg.set_gesture_mode("2b042", ButtonId::HapticPanel, true);
 
         let plan = plan_for_device(&cfg, "2b042", route(), None);
         assert!(
-            !plan.gesture_bindings.is_empty(),
-            "a panel gesture owner must arm the HID++ gesture divert"
+            plan.gesture_bindings.contains_key(&ButtonId::GestureButton)
+                && plan.gesture_bindings.contains_key(&ButtonId::HapticPanel),
+            "both sources need their own dispatch map, got: {:?}",
+            plan.gesture_bindings.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !plan
+                .divert_buttons
+                .iter()
+                .any(|&(cid, _)| cid == GESTURE_BUTTON_CID || cid == HAPTIC_PANEL_CID),
+            "a raw-XY-diverted source must never also be plain-diverted"
+        );
+    }
+
+    #[test]
+    fn haptic_panel_gestures_when_promoted() {
+        // The MX Master 4 haptic panel is a HID++ gesture source: promoting it
+        // into gesture mode must arm the raw-XY gesture divert, exactly like
+        // the dedicated gesture button.
+        let mut cfg = Config::default();
+        cfg.set_gesture_mode("2b042", ButtonId::HapticPanel, true);
+
+        let plan = plan_for_device(&cfg, "2b042", route(), None);
+        assert!(
+            plan.gesture_bindings.contains_key(&ButtonId::HapticPanel),
+            "a gesture-mode panel must arm the HID++ gesture divert"
         );
         assert!(
             !plan
                 .divert_buttons
                 .iter()
                 .any(|&(cid, _)| cid == HAPTIC_PANEL_CID),
-            "the gesture owner is delivered via raw-XY divert, never a plain one"
+            "a gesture-mode source is delivered via raw-XY divert, never a plain one"
         );
     }
 
     #[test]
-    fn single_bound_haptic_panel_is_plain_diverted_when_not_the_owner() {
-        // While the dedicated button owns gestures (the default), a single
+    fn single_bound_haptic_panel_is_plain_diverted_when_not_in_gesture_mode() {
+        // While only the dedicated button gestures (the default), a single
         // action bound to the panel is deliverable only via a plain HID++
         // divert dispatching ButtonId::HapticPanel.
         let mut cfg = Config::default();
@@ -192,7 +207,6 @@ mod tests {
         // so with gestures off a non-default single binding on it is only
         // deliverable via a plain HID++ divert.
         let mut cfg = Config::default();
-        cfg.disable_gestures("2b042");
         cfg.set_binding(
             "2b042",
             ButtonId::GestureButton,
@@ -212,13 +226,13 @@ mod tests {
     }
 
     #[test]
-    fn gesture_owner_button_is_never_plain_diverted() {
-        // When the gesture button owns the gesture role, the raw-XY gesture
+    fn gesture_mode_button_is_never_plain_diverted() {
+        // While the gesture button is in gesture mode, the raw-XY gesture
         // divert owns CID 0x00c3 — a plain divert on top would strip raw-XY.
         // (Its default Click projects to a non-default single action, so only
-        // the owner rule keeps it out of the plain list.)
+        // the gesture-mode rule keeps it out of the plain list.)
         let mut cfg = Config::default();
-        cfg.set_gesture_owner("2b042", ButtonId::GestureButton);
+        cfg.set_gesture_mode("2b042", ButtonId::GestureButton, true);
 
         let plan = plan_for_device(&cfg, "2b042", route(), None);
         assert!(
@@ -239,7 +253,7 @@ mod tests {
         // With gestures off and no explicit binding, the gesture button keeps
         // its native HID behavior — same contract as the standard buttons.
         let mut cfg = Config::default();
-        cfg.disable_gestures("2b042");
+        cfg.set_gesture_mode("2b042", ButtonId::GestureButton, false);
 
         let plan = plan_for_device(&cfg, "2b042", route(), None);
         assert!(

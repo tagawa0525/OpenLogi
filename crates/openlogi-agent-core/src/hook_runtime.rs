@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use openlogi_core::binding::{
     Action, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
@@ -44,24 +45,49 @@ pub type SharedHookMaps = Arc<RwLock<HookMaps>>;
 /// *mid-motion* like the HID++ gesture-button path in `openlogi-hid`. This wrapper
 /// adds only the button identity the accumulator doesn't track; a press that
 /// never commits a direction is a plain click, fired on release.
+/// A gesture hold this old is presumed stale — real hold+swipe interactions
+/// finish in well under a second, and only a lost button-up (with no OS
+/// interrupt to trigger [`HoldState::cancel`]) leaves one lingering.
+const STALE_HOLD: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct HoldState {
-    button: Option<ButtonId>,
+    /// The held button and when its hold began. The timestamp exists solely
+    /// for stale-hold recovery in [`Self::begin`].
+    button: Option<(ButtonId, Instant)>,
     swipe: SwipeAccumulator,
 }
 
 impl HoldState {
-    /// Begin a hold for `button`.
-    fn begin(&mut self, button: ButtonId) {
-        self.button = Some(button);
+    /// Begin a hold for `button`, unless another button's live hold is in
+    /// progress — with several gesture buttons the first hold wins, so a second
+    /// press can't hijack the accumulated motion mid-swipe. Returns whether the
+    /// hold started (the caller lets a refused press fall through to the
+    /// single-action path, where it means its plain click).
+    ///
+    /// Two presses recover a hold whose button-up was lost (nothing else ever
+    /// clears it when the OS drops a release without an interrupt): a re-press
+    /// of the held button itself — a button cannot be pressed while down, so
+    /// this is proof the release was lost — and any press once the hold has
+    /// aged past [`STALE_HOLD`], without which every other gesture button
+    /// would stay refused indefinitely.
+    fn begin(&mut self, button: ButtonId) -> bool {
+        if let Some((held, since)) = self.button
+            && held != button
+            && since.elapsed() < STALE_HOLD
+        {
+            return false;
+        }
+        self.button = Some((button, Instant::now()));
         self.swipe.begin();
+        true
     }
 
     /// Feed a pointer-move delta into the active hold, tagging a committed swipe
     /// with the held button. Returns `Some((button, direction))` exactly once per
     /// hold, or `None` while still too short, already fired, or not holding.
     fn accumulate(&mut self, dx: i32, dy: i32) -> Option<(ButtonId, GestureDirection)> {
-        let button = self.button?;
+        let (button, _) = self.button?;
         self.swipe.accumulate(dx, dy).map(|dir| (button, dir))
     }
 
@@ -70,7 +96,7 @@ impl HoldState {
     /// `Some(false)` when a swipe already fired, and `None` for a stray release
     /// of a button we weren't holding.
     fn end(&mut self, button: ButtonId) -> Option<bool> {
-        if self.button == Some(button) {
+        if self.button.is_some_and(|(held, _)| held == button) {
             self.button = None;
             Some(self.swipe.end())
         } else {
@@ -84,6 +110,17 @@ impl HoldState {
     fn cancel(&mut self) {
         self.button = None;
         self.swipe.end();
+    }
+
+    /// Age the current hold past the staleness horizon, so tests can exercise
+    /// the lost-button-up recovery without sleeping.
+    #[cfg(test)]
+    fn backdate_for_test(&mut self) {
+        if let Some((_, since)) = &mut self.button
+            && let Some(aged) = Instant::now().checked_sub(STALE_HOLD)
+        {
+            *since = aged;
+        }
     }
 }
 
@@ -136,8 +173,11 @@ pub fn start(
                 // free to drift via the pass-through `Moved` events during the hold.
                 if pressed {
                     let is_gesture = hooks.read().is_ok_and(|m| m.gestures.contains_key(&id));
-                    if is_gesture {
-                        HOLD.with_borrow_mut(|h| h.begin(id));
+                    // A refused begin — a second gesture button pressed
+                    // mid-hold — falls through to the single-action path: the
+                    // first hold wins and this press still means its plain
+                    // click.
+                    if is_gesture && HOLD.with_borrow_mut(|h| h.begin(id)) {
                         return EventDisposition::Suppress;
                     }
                 } else {
@@ -343,6 +383,68 @@ mod tests {
             "commits at most once per hold"
         );
         // A release after a committed swipe is NOT a click.
+        assert_eq!(hold.end(ButtonId::Back), Some(false));
+    }
+
+    #[test]
+    fn a_same_button_re_press_restarts_the_stale_hold() {
+        // A press for the very button we think is held can only mean its
+        // release was lost (a button cannot be pressed while down): the hold
+        // restarts instead of wedging on the stale state.
+        let mut hold = HoldState::default();
+        assert!(hold.begin(ButtonId::Back));
+        assert!(
+            hold.begin(ButtonId::Back),
+            "a same-button re-press is proof of a lost release"
+        );
+        hold.swipe.backdate_hold_for_test();
+        assert_eq!(
+            hold.accumulate(GESTURE_SWIPE_THRESHOLD + 10, 0),
+            Some((ButtonId::Back, GestureDirection::Right))
+        );
+    }
+
+    #[test]
+    fn an_aged_hold_yields_to_a_new_buttons_press() {
+        // No release ever clears a hold whose button-up was lost (and no OS
+        // interrupt fired), so a different gesture button's press takes over
+        // once the hold is old enough to be presumed stale — otherwise every
+        // gesture button stays wedged until the stale one is pressed again.
+        let mut hold = HoldState::default();
+        assert!(hold.begin(ButtonId::Back));
+        hold.backdate_for_test();
+        assert!(
+            hold.begin(ButtonId::Forward),
+            "an aged hold must yield to a new press"
+        );
+        hold.swipe.backdate_hold_for_test();
+        assert_eq!(
+            hold.accumulate(GESTURE_SWIPE_THRESHOLD + 10, 0),
+            Some((ButtonId::Forward, GestureDirection::Right))
+        );
+    }
+
+    #[test]
+    fn begin_is_first_wins_while_a_hold_is_active() {
+        // Two gesture buttons pressed together: the first hold keeps the
+        // accumulator; the second press is refused (its caller falls through to
+        // the single-action path) and its release is a stray, not a click.
+        let mut hold = HoldState::default();
+        assert!(hold.begin(ButtonId::Back));
+        hold.swipe.backdate_hold_for_test();
+        assert!(
+            !hold.begin(ButtonId::Forward),
+            "a second press must not hijack the active hold"
+        );
+
+        // The accumulated motion still belongs to the first button...
+        assert_eq!(
+            hold.accumulate(GESTURE_SWIPE_THRESHOLD + 10, 0),
+            Some((ButtonId::Back, GestureDirection::Right))
+        );
+        // ...the refused button's release is a stray...
+        assert_eq!(hold.end(ButtonId::Forward), None);
+        // ...and the first hold ends normally (swipe fired, so not a click).
         assert_eq!(hold.end(ButtonId::Back), Some(false));
     }
 
